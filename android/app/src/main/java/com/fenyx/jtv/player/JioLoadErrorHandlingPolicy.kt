@@ -20,10 +20,33 @@ class JioLoadErrorHandlingPolicy(
     private val tokenRetryLimit: Int = 4
 ) : DefaultLoadErrorHandlingPolicy(/* minimumLoadableRetryCount = */ 6) {
 
+    // Media3 asks for a fallback BEFORE a retry, and the default excludes the failing rendition for 60 s
+    // on 403/404/410. For an expired token that only drops the picture quality, so retry instead.
+    override fun getFallbackSelectionFor(
+        fallbackOptions: LoadErrorHandlingPolicy.FallbackOptions,
+        loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo
+    ): LoadErrorHandlingPolicy.FallbackSelection? {
+        val ex = loadErrorInfo.exception
+        if (ex is HttpDataSource.InvalidResponseCodeException &&
+            retryInsteadOfFallback(ex.responseCode, loadErrorInfo.errorCount, tokenRetryLimit)
+        ) return null
+        return super.getFallbackSelectionFor(fallbackOptions, loadErrorInfo)
+    }
+
+    internal companion object {
+        fun retryInsteadOfFallback(code: Int, errorCount: Int, limit: Int): Boolean =
+            (code == 403 || code == 404 || code == 410) && errorCount <= limit
+    }
+
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
         val ex = loadErrorInfo.exception
         if (ex is HttpDataSource.InvalidResponseCodeException) {
             val code = ex.responseCode
+            // The request already carried the newest token and that token is past its exp: retrying
+            // can't help, so fail now and let the app fetch a new URL (or show why there is none).
+            if (code == 403 && com.fenyx.jtv.data.JioApiClient.isStreamTokenExpired(ex.dataSpec.uri.toString())) {
+                return C.TIME_UNSET
+            }
             if (code == 403 || code == 404 || code == 410) {
                 return if (loadErrorInfo.errorCount <= tokenRetryLimit) {
                     // Quick backoff; gives the token-refresh loop a beat to publish a fresh token.

@@ -16,22 +16,72 @@ Android TV app — and a full JioTV experience in any browser.
 | Stream type | Web player | External players (M3U) | Notes |
 |---|---|---|---|
 | **Non-DRM HLS** (most channels) | ✅ over **plain HTTP** | ✅ | Played with **hls.js** (software AES-128), so no HTTPS/Web-Crypto needed. The AES key is fetched with the license headers the key host expects. |
-| **DRM DASH / Widevine** (some premium) | ✅ over **HTTPS** only | ❌ | Browser Widevine needs a secure context — use the HTTPS URL. Generic players can't decrypt Widevine. |
+| **DRM DASH / Widevine** (some premium) | ✅ over **HTTPS** only | ✅ with `drm=1`, Widevine players only | Browser Widevine needs a secure context — use the HTTPS URL. External: Kodi (inputstream.adaptive), TiviMate, OTT Navigator. VLC can't decrypt Widevine. |
 
 The web player uses **hls.js** for non-DRM HLS (works on `http://<lan-ip>`) and **Shaka Player** for
 DRM DASH. Every manifest/segment/key is proxied through the server so the browser never talks to the
 Jio CDN directly and never sees an expired token.
 
-## Quick start (Docker) — no `.env` needed
+## Install
+
+The ready-made image is `ghcr.io/f-e-n-y-x/jiotv-server:latest` (amd64 and arm64). It uses **one port,
+29180**, for the web page, the app and finding the server on your network. Pick one way:
+
+### Portainer (stack)
+
+**Stacks → Add stack → Web editor**, paste [`stack.yml`](stack.yml), then **Deploy the stack**:
+
+```yaml
+services:
+  jtv-server:
+    image: ghcr.io/f-e-n-y-x/jiotv-server:latest
+    container_name: jtv-server
+    restart: unless-stopped
+    init: true
+    environment:
+      - SERVER_NAME=JTV server
+    ports:
+      - "29180:29180"
+      - "8443:8443"   # optional: HTTPS, only for DRM channels in the browser
+    volumes:
+      - jtv-data:/app/data
+
+volumes:
+  jtv-data:
+```
+
+To update later: **Stacks → jtv → Editor → Update the stack** with *Re-pull image* on.
+
+### docker run
 
 ```bash
-cd server
-docker compose up -d --build
+docker volume create jtv-data
+docker run -d --name jtv-server --restart unless-stopped --init \
+  -p 29180:29180 -p 8443:8443 \
+  -e SERVER_NAME="JTV server" \
+  -v jtv-data:/app/data \
+  ghcr.io/f-e-n-y-x/jiotv-server:latest
 ```
+
+Update: `docker pull ghcr.io/f-e-n-y-x/jiotv-server:latest && docker rm -f jtv-server`, then run the
+same `docker run` again (your login and codes stay in the `jtv-data` volume).
+
+### docker compose
+
+```bash
+mkdir jtv && cd jtv
+curl -fsSLo compose.yml https://raw.githubusercontent.com/F-e-n-y-x/JioTV-AndroidTV-/main/server/stack.yml
+docker compose up -d
+```
+
+Update: `docker compose pull && docker compose up -d`.
+
+Building from source instead: `cd server && docker compose up -d --build` (uses
+[`docker-compose.yml`](docker-compose.yml)).
 
 Then set everything up **in the browser** (nothing to edit on disk):
 
-1. Open `http://<host>:8080`. On first run either **set an admin password** or choose
+1. Open `http://<host>:29180`. On first run either **set an admin password** or choose
    **“Continue without a password”** (open on your LAN). Saved to `data/config.json`.
 2. **Account** tab → **Send OTP → Verify** with your Jio number (one time). All TVs pick this up.
 3. **TV access codes** → add a short code per device.
@@ -41,6 +91,57 @@ Then set everything up **in the browser** (nothing to edit on disk):
 > DRM channels in the **browser** need HTTPS. The server also listens on `https://<host>:8443` with a
 > self-signed cert (accept the one-time warning), or use the optional Caddy profile for a real domain:
 > edit `Caddyfile`, then `docker compose --profile https up -d`.
+
+## Upgrading: data volume permissions
+
+The image now runs as the unprivileged **`node` user (uid/gid 1000)** instead of root. A **new**
+named volume gets the right owner automatically. A volume (or bind-mounted folder) created by an
+**older image** still holds root-owned files (`jtv.sqlite`, `config.json`, `tls-*.pem`), and the
+server refuses to start with a message listing them. Fix it **once**, then start the new image:
+
+```bash
+docker stop jtv-server
+# named volume (compose default; Portainer stacks prefix it, e.g. jtv_jtv-data — check `docker volume ls`)
+docker run --rm -v jtv-data:/app/data alpine chown -R 1000:1000 /app/data
+# bind mount instead of a volume
+sudo chown -R 1000:1000 /path/to/data
+```
+
+In Portainer: stop the stack, run the `docker run … chown` line above from the host shell (or a
+one-off `alpine` container in the Portainer UI with the volume mounted at `/app/data` and the
+command `chown -R 1000:1000 /app/data`), then pull/redeploy the stack.
+
+## Found automatically on your network
+
+The app's **Self-hosted server** screen lists the JTV servers on your home network. Each server answers
+on port **29180** (`GET /jtv-server`). By default that one port also serves the web page and the app,
+so it's the only port to open on your LAN.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SERVER_NAME` | `JTV server` | Name shown in the app's list |
+| `PORT` | `29180` | Web page + app port (older setups may keep `8080`; then also map `29180:29180` for discovery) |
+| `PUBLIC_PORT` | `PORT` | The host port the app should use, if Docker maps a different one |
+| `DISCOVERY_PORT` | `29180` | Discovery port; `0` turns discovery off |
+
+Don't forward 29180 from your router to the internet.
+
+## Reverse proxy (Cloudflare / Caddy)
+
+`TRUST_PROXY` makes the server honour `X-Forwarded-Proto/Host/For` (and Cloudflare's `CF-Connecting-IP`),
+so playlist and segment links come out as `https://your.domain/…` and rate limits see the real client IP.
+The default `loopback,linklocal,uniquelocal` trusts those headers only when the request comes from a
+loopback or private (10/8, 172.16/12, 192.168/16, fc00::/7) address, where cloudflared, Caddy and Docker
+proxies sit; direct internet clients can't spoof them. It also accepts `true` (trust anyone), `false`,
+or a list of proxy IPs/CIDRs.
+
+Rate limits (per client IP): admin login / setup / OTP verify / `/api/credentials` 10 per minute,
+OTP send 5/min, `/api/refresh` and `/api/admin/refresh` 10/min, `/playlist.m3u` 30/min, `/license` 60/min. Streaming
+(`/live`, `/seg`, `/dash`, `/api/proxy`) is not limited. Access codes are masked (`code=[redacted]`,
+`/dash/[redacted]/…`) in logs,
+and Docker logs rotate at 3 × 10 MB.
+
+New TV access codes must be **6–12** characters; older 4–5 character codes keep working.
 
 ## Web dashboard
 
@@ -59,19 +160,21 @@ quality, favourites-only, EPG guide and catch-up**, then paste it into your play
 `.m3u`). The same options work directly on the API:
 
 ```
-http://<host>:8080/playlist.m3u?code=<accesscode>&lang=Hindi,English&group=News&quality=720&epg=1&catchup=1
+http://<host>:29180/playlist.m3u?code=<accesscode>&lang=Hindi,English&group=News&quality=720&epg=1&catchup=1
 ```
 
-Only **non-DRM** channels are servable to external players (DRM/Widevine can't be decrypted by
-generic apps). EPG works best with an **XMLTV** source selected.
+By default only **non-DRM** channels play in external players. Add `drm=1` for Widevine players
+(Kodi with inputstream.adaptive, TiviMate, OTT Navigator); see *Playlist options* below. EPG works best
+with an **XMLTV** source selected.
 
 ## Local dev (Node 22+)
 
 ```bash
 cd server
 npm install
-npm run dev            # tsx watch on :8080 (+ :8443 https)
+npm run dev            # tsx watch on :29180 (+ :8443 https)
 npm run typecheck      # tsc --noEmit
+npm test               # unit tests (node:test via tsx)
 npm --prefix web run build   # build the web UI into web/dist
 npm run build && npm start
 ```
@@ -101,8 +204,49 @@ Machine/player endpoints use a **TV access code** (bearer header or `?code=`).
 | GET  | `/api/credentials` | **code** | **TVs pull the shared AuthData here** |
 | GET  | `/playlist.m3u` | **code** | M3U playlist for external players |
 | GET  | `/live/:id.m3u8` | **code** | Resolve + proxy a channel (HLS, quality/catch-up) |
+| GET  | `/live/:id.mpd` | **code** | Rewritten Widevine DASH manifest (`drm=1` entries) |
 | GET  | `/seg` | **code** | Segment/key proxy for external players |
-| GET  | `/epg.xml` | **code** | XMLTV guide for external players |
+| GET  | `/dash/:code/:id/*` | **code (in path)** | DASH segment proxy for `drm=1` entries |
+| POST | `/license/:id` | **code** | Widevine license proxy for external players (raw challenge in/out, 60/min) |
+| GET  | `/epg.xml` · `/epg.xml.gz` | **code** | XMLTV guide for external players (native guide streamed from `DATA_DIR/epg.xml.gz`) |
+| POST | `/api/reports` | **code** | TV app uploads a crash / ANR report (redacted again on receipt) |
+| GET/DELETE | `/api/admin/reports…` | cookie | Last 50 problem reports (also shown on the Account page) |
+
+### Playlist options worth knowing
+
+- `drm=hide` leaves out channels that need Widevine (external players can't decrypt them). Jio's
+  channel list has no reliable DRM flag, so the server learns it: on a channel's first live play the
+  proxy checks whether Jio's non-DRM HLS works; if only the DASH does, it stores mode `drm` in the
+  `stream_modes` SQLite table (`hls` otherwise). `drm=hide` hides the `drm` ones. A channel nobody has
+  played yet is still listed; once a player gets the 415 from `/live` it is hidden from the next refresh.
+- `drm=1` (opt-in; off by default so VLC and other non-Widevine players keep the plain list) turns the
+  same learned Widevine channels into Kodi-style DASH entries instead of hiding them:
+
+  ```
+  #KODIPROP:inputstream=inputstream.adaptive
+  #KODIPROP:inputstream.adaptive.manifest_type=mpd
+  #KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha
+  #KODIPROP:inputstream.adaptive.license_key=http://<host>:29180/license/<id>?code=<code>|Content-Type=application/octet-stream|R{SSM}|
+  #EXTINF:-1 tvg-id="<id>" … ,<name>
+  http://<host>:29180/live/<id>.mpd?ts=1&code=<code>
+  ```
+
+  The playlist never contains Jio tokens. `/live/<id>.mpd` returns Jio's manifest with its BaseURL
+  pointed at `/dash/<code>/<id>/` (the code is in the path because players drop a BaseURL's query when
+  resolving segment names); the server adds the `__hdnea__` cookie on the way to Jio's CDN.
+  `/license/<id>` forwards the raw challenge to Jio's license server with the account headers, only to
+  Jio hosts. A DRM channel that hasn't been learned yet stays a plain `.m3u8` entry until its first
+  play (which answers 415 and learns it); refresh the playlist after that.
+- The native XMLTV guide is built lazily on the first `/epg.xml` request, written through gzip straight
+  to `DATA_DIR/epg.xml.gz` (never held in memory), reused after a restart and rebuilt every 6 h while
+  players keep asking. `/epg.xml` is sent with `Content-Encoding: gzip` when the client accepts it.
+
+### Upgrade notes (v2)
+
+No manual migration. On start the server creates the `stream_modes` table, and writes
+`DATA_DIR/epg.xml.gz` and `DATA_DIR/reports/` on first use. The channel list now comes from Jio's v3.1
+list plus 7 allow-listed Zee regional channels from v1.4, so ~98 dead v1.4-only channels disappear
+from `/playlist.m3u` and the guide.
 
 ## Layout
 
@@ -116,7 +260,7 @@ server/
 │  ├─ refresh.ts           central token-refresh scheduler
 │  ├─ api/                 routes.ts · play.ts (web player) · playlist.ts (M3U/API) · auth.ts
 │  ├─ https.ts             self-signed cert (self-hosted HTTPS)
-│  └─ server.ts            bootstrap (serves web/ + API on :8080 and :8443)
+│  └─ server.ts            bootstrap (serves web/ + API on :29180 and :8443)
 ├─ web/                    React/Vite/Tailwind SPA (hls.js + Shaka), built to web/dist
 ├─ Dockerfile · docker-compose.yml · Caddyfile
 ```

@@ -8,7 +8,6 @@ import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -28,8 +27,27 @@ data class EpgProgram(
     val srno: String? = null,
     val showId: String? = null,
     val showtime: String? = null,
-    val catchup: Boolean = false
-)
+    val catchup: Boolean = false,
+    // Native-guide extras (null for XMLTV). Kept small: cast is trimmed, the poster is a short path.
+    /** Episode synopsis, only when it differs from [description]. */
+    val episodeDesc: String? = null,
+    /** "Series", "Movie", "Sports", "News"... */
+    val category: String? = null,
+    /** First genre only, e.g. "Sitcom". */
+    val genre: String? = null,
+    /** Age rating: "U", "UA" or "A". */
+    val rating: String? = null,
+    /** Up to four names, roles stripped, joined with ", ". */
+    val cast: String? = null,
+    val director: String? = null,
+    /** Episode number, null when the guide has none. */
+    val episodeNum: Int? = null,
+    /** Show picture path from Jio's guide ("epgdata/….jpg"); see [posterUrl]. */
+    val poster: String? = null,
+) {
+    /** The show picture (16:9, served at 1920×1080: always load it with a small decode size). */
+    val posterUrl: String? get() = poster?.let { "https://jiotvimages.cdn.jio.com/dare_images/shows/$it" }
+}
 
 enum class EpgSyncStatus {
     IDLE, DOWNLOADING, EXTRACTING, PARSING, COMPLETED, ERROR
@@ -44,10 +62,54 @@ class EpgRepository(private val context: Context) {
          * passed in (not created here) because it is not thread-safe and the parse loop reuses a single
          * instance — so this stays allocation-free on the hot path while remaining unit-testable.
          */
+        /** A trimmed string field, or null when it is missing, blank or JSON null. */
+        internal fun jsonText(obj: org.json.JSONObject, key: String): String? {
+            if (!obj.has(key) || obj.isNull(key)) return null
+            return obj.optString(key, "").trim().takeIf { it.isNotEmpty() && it != "null" }
+        }
+
+        /** `showGenre` is an array (["Sitcom"]); a string is accepted too. First entry only. */
+        internal fun firstGenre(obj: org.json.JSONObject): String? {
+            val arr = obj.optJSONArray("showGenre")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val g = arr.optString(i, "").trim()
+                    if (g.isNotEmpty() && g != "null") return g
+                }
+                return null
+            }
+            return jsonText(obj, "showGenre")?.trim('[', ']', ' ')?.split(',')?.firstOrNull()
+                ?.trim(' ', '\'', '"')?.takeIf { it.isNotEmpty() }
+        }
+
+        private val ROLE = Regex("\\([^)]*\\)")
+
+        /** "Name (Role),Name (Role),..." -> "Name, Name, Name, Name" (first four, roles dropped). */
+        internal fun shortCast(raw: String?): String? = shortNames(raw?.replace(ROLE, ""), 4)
+
+        internal fun shortNames(raw: String?, max: Int): String? {
+            if (raw.isNullOrBlank()) return null
+            return raw.split(',').asSequence().map { it.trim() }.filter { it.isNotEmpty() }
+                .distinct().take(max).joinToString(", ").takeIf { it.isNotEmpty() }
+        }
+
         internal fun parseXmltvMillis(value: String?, fmt: SimpleDateFormat): Long {
             if (value.isNullOrBlank()) return 0
             return try { fmt.parse(value)?.time ?: 0 } catch (e: Exception) { 0 }
         }
+
+        private const val DAY_MS = 24 * 60 * 60 * 1000L
+        private const val IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000L
+
+        /** Days since the epoch on the India calendar (Jio's guide days are IST days). */
+        internal fun istDay(ms: Long): Long = Math.floorDiv(ms + IST_OFFSET_MS, DAY_MS)
+
+        /**
+         * The IST day a one-day guide covers, by its middle programme (the first show often starts
+         * before midnight), or null when empty.
+         */
+        internal fun guideDay(programs: List<EpgProgram>): Long? =
+            programs.sortedBy { it.startMs }.getOrNull(programs.size / 2)?.let { istDay(it.startMs) }
     }
 
     private val TAG = "EpgRepository"
@@ -119,10 +181,7 @@ class EpgRepository(private val context: Context) {
                     } else {
                         buffered
                     }
-                    val outputStream = FileOutputStream(cacheFile)
-                    inputStream.copyTo(outputStream)
-                    outputStream.close()
-                    inputStream.close()
+                    inputStream.use { input -> cacheFile.writeAtomically { input.copyTo(it) } }
                     Log.d(TAG, "EPG downloaded and saved (gzip=$isGzip)")
                 } else {
                     Log.e(TAG, "Failed to download EPG: ${connection?.responseCode}")
@@ -222,19 +281,29 @@ class EpgRepository(private val context: Context) {
     }
 
     /**
-     * Jio's guide for one channel and day. Jio's "today" (offset 0) lags for hours after midnight and
-     * ends before now; then its "tomorrow" (the real today) is fetched too and merged.
+     * Jio's guide for the IST day [offset] days from today, or empty. Jio's CDN sometimes answers with
+     * another day: then refetch once past the CDN cache, and after midnight (Jio's own day lags) try its
+     * next offset. A guide that still covers the wrong day is dropped, never returned as this one.
      */
     suspend fun getNativeEpgForChannel(channelId: String, offset: Int = 0): List<EpgProgram> {
-        val day = fetchNativeDay(channelId, offset)
-        if (offset != 0 || day.any { it.stopMs > System.currentTimeMillis() }) return day
-        return (day + fetchNativeDay(channelId, 1)).distinctBy { it.startMs }.sortedBy { it.startMs }
+        val day = istDay(JioClock.nowMs()) + offset
+        val first = fetchNativeEpg(channelId, offset, bust = false)
+        if (first.isEmpty() || guideDay(first) == day) return first
+        val busted = fetchNativeEpg(channelId, offset, bust = true)
+        if (guideDay(busted) == day) return busted
+        if (guideDay(busted) == day - 1) {
+            val next = fetchNativeEpg(channelId, offset + 1, bust = false)
+            if (guideDay(next) == day) return next
+        }
+        Log.w(TAG, "Guide for $channelId offset $offset covers day ${guideDay(busted)}, not $day; dropped")
+        return emptyList()
     }
 
-    private suspend fun fetchNativeDay(channelId: String, offset: Int): List<EpgProgram> = withContext(Dispatchers.IO) {
+    private suspend fun fetchNativeEpg(channelId: String, offset: Int, bust: Boolean): List<EpgProgram> = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
-            val url = URL("https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?offset=$offset&channel_id=$channelId&langId=6")
+            val buster = if (bust) "&_=${System.currentTimeMillis()}" else ""
+            val url = URL("https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?offset=$offset&channel_id=$channelId&langId=6$buster")
             connection = url.openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             connection.connectTimeout = 10000
@@ -251,6 +320,10 @@ class EpgRepository(private val context: Context) {
                 val json = org.json.JSONObject(text)
                 val epgArray = json.optJSONArray("epg") ?: return@withContext emptyList()
                 val programs = mutableListOf<EpgProgram>()
+                // The same category/genre/cast/director repeats on every slot of a channel: share one
+                // String instance per distinct value so a day of programmes stays light.
+                val pool = HashMap<String, String>()
+                fun shared(v: String?): String? = v?.let { pool.getOrPut(it) { it } }
                 for (i in 0 until epgArray.length()) {
                     val obj = epgArray.getJSONObject(i)
                     val title = obj.optString("showname", "")
@@ -262,7 +335,19 @@ class EpgRepository(private val context: Context) {
                     val showtime = if (obj.has("showtime")) obj.optString("showtime") else null
                     val catchup = obj.optBoolean("isCatchupAvailable", false)
                     if (title.isNotEmpty() && startMs > 0 && stopMs > 0) {
-                        programs.add(EpgProgram(title, desc, startMs, stopMs, srno, showId, showtime, catchup))
+                        programs.add(
+                            EpgProgram(
+                                title, desc, startMs, stopMs, srno, showId, showtime, catchup,
+                                episodeDesc = jsonText(obj, "episode_desc")?.takeIf { it != desc.trim() },
+                                category = shared(jsonText(obj, "showCategory")),
+                                genre = shared(firstGenre(obj)),
+                                rating = shared(jsonText(obj, "pcr")),
+                                cast = shared(shortCast(jsonText(obj, "starCast"))),
+                                director = shared(shortNames(jsonText(obj, "director"), 3)),
+                                episodeNum = obj.opt("episode_num")?.toString()?.trim()?.toIntOrNull()?.takeIf { it > 0 },
+                                poster = jsonText(obj, "episodePoster") ?: jsonText(obj, "episodeThumbnail"),
+                            )
+                        )
                     }
                 }
                 return@withContext programs

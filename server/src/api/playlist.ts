@@ -1,26 +1,34 @@
-import { getNativeXmltv } from "../jio/nativeXmltv";
+import fs from "node:fs";
+import { getNativeXmltvFile } from "../jio/nativeXmltv";
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
-import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { getChannels, type Channel } from "../jio/channels";
 import { getNativeEpg } from "../jio/epg";
-import { getPlaybackInfo, proxyUpstream, rewriteManifest } from "../proxy/streamProxy";
-import { getFavorites, hasCode } from "../store/db";
+import { getPlaybackInfo, proxyUpstream, proxyLicense, rewriteManifest, rewriteMpdForPlayer, manifestDir } from "../proxy/streamProxy";
+import { isExtraChannel, getExtraChannelSync, getExtraChannel } from "../jio/extraChannels";
+import { getFavorites, hasCode, getDrmOnlyChannelIds } from "../store/db";
+import { filterPlaylistChannels, needsWidevine } from "./playlistFilter";
 import { isAuthEnabled, envServerToken, getEpgConfig } from "../store/settings";
+import { baseUrl } from "../util/baseUrl";
 
 /**
  * Public (access-code authenticated) endpoints for external IPTV players — VLC, TiviMate, OTT
  * Navigator, Kodi. Unlike the browser player (cookie/admin session) these are reachable with a `?code=`
  * query param so a TV app or player with no cookie jar can use them. When server auth is disabled the
- * code is not required. Only the non-DRM (HLS) channels are servable here — DRM/Widevine channels can't
- * be decrypted by generic players, so `/live` returns 415 for them.
+ * code is not required. DRM/Widevine channels are served only to the `drm=1` playlist (Kodi-style
+ * KODIPROP entries: `/live/:id.mpd` + `/dash/...` segments + `/license/:id`); a plain `.m3u8` request
+ * for one gets a 415.
  */
 
 /** True when the request carries a valid access code (or auth is disabled entirely). */
 function codeOk(req: FastifyRequest): boolean {
+  return codeValid(String((req.query as Record<string, unknown>).code ?? ""));
+}
+
+function codeValid(raw: string): boolean {
   if (!isAuthEnabled()) return true;
-  const code = String((req.query as Record<string, unknown>).code ?? "").trim();
+  const code = raw.trim();
   const env = envServerToken();
   return (!!env && code === env) || hasCode(code) || hasCode(code.toUpperCase());
 }
@@ -33,11 +41,6 @@ function requireCode(req: FastifyRequest, reply: FastifyReply, done: () => void)
   done();
 }
 
-/** Absolute base URL of this server as the client reached it (honours host + scheme). */
-function baseUrl(req: FastifyRequest): string {
-  const host = req.headers.host ?? `localhost`;
-  return `${req.protocol}://${host}`;
-}
 
 function splitCsv(v: unknown): Set<string> {
   const s = String(v ?? "").trim();
@@ -52,7 +55,7 @@ function attr(v: string): string {
 
 export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void> {
   // ── M3U playlist for external players ──
-  app.get("/playlist.m3u", { preHandler: requireCode }, async (req, reply) => {
+  app.get("/playlist.m3u", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, preHandler: requireCode }, async (req, reply) => {
     const q = req.query as Record<string, string | undefined>;
     const code = (q.code ?? "").trim();
     const langs = splitCsv(q.lang);
@@ -61,35 +64,55 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
     const includeEpg = q.epg === "1" || q.epg === "true";
     const enableCatchup = q.catchup === "1" || q.catchup === "true";
     const hideDrm = q.drm === "hide" || q.drm === "0" || q.drm === "false";
+    // `drm=1`: Widevine channels become Kodi-style DASH entries (KODIPROP license lines). Opt-in, so
+    // players without Widevine (VLC, most phones) keep getting the plain list.
+    const withDrm = q.drm === "1" || q.drm === "true" || q.drm === "widevine";
     const quality = String(q.quality ?? "auto").toLowerCase();
 
     const all = await getChannels();
     const favs = onlyFav ? new Set(getFavorites()) : null;
-    const channels = all.filter((c) => {
-      if (langs.size && !langs.has(c.language.toLowerCase())) return false;
-      if (groups.size && !groups.has(c.group.toLowerCase())) return false;
-      if (favs && !favs.has(c.id)) return false;
-      if (hideDrm && c.isDrm) return false;
-      return true;
-    });
+    const drmOnlyIds = hideDrm || withDrm ? getDrmOnlyChannelIds() : new Set<string>();
+    const channels = filterPlaylistChannels(all, { langs, groups, favs, hideDrm, drmOnlyIds });
 
     const base = baseUrl(req);
     const codeQ = code ? `&code=${encodeURIComponent(code)}` : "";
     const qualityQ = quality && quality !== "auto" ? `&q=${encodeURIComponent(quality)}` : "";
 
     const lines: string[] = [];
-    const header = includeEpg
-      ? `#EXTM3U url-tvg="${base}/epg.xml${code ? `?code=${encodeURIComponent(code)}` : ""}"`
-      : "#EXTM3U";
+    // `url-tvg` and `x-tvg-url` both point at the guide: players differ in which one they read.
+    const epgUrl = `${base}/epg.xml${code ? `?code=${encodeURIComponent(code)}` : ""}`;
+    const header = includeEpg ? `#EXTM3U url-tvg="${epgUrl}" x-tvg-url="${epgUrl}"` : "#EXTM3U";
     lines.push(header);
 
     for (const c of channels) {
-      const streamUrl = `${base}/live/${encodeURIComponent(c.id)}.m3u8?ts=1${codeQ}${qualityQ}`;
-      const catchupAttr = enableCatchup
+      const extra = isExtraChannel(c.id) ? getExtraChannelSync(c.id) : undefined;
+      const isMpd = extra ? extra.isMpd : false;
+      const widevine = withDrm && !extra && needsWidevine(c, drmOnlyIds);
+      const streamExt = isMpd || widevine ? "mpd" : "m3u8";
+      const streamUrl = `${base}/live/${encodeURIComponent(c.id)}.${streamExt}?ts=1${codeQ}${qualityQ}`;
+      // Only channels Jio actually keeps a catch-up archive for get the catch-up attributes.
+      const catchupAttr = enableCatchup && c.isCatchup
         ? `catchup="default" catchup-days="7" catchup-source="${base}/live/${encodeURIComponent(c.id)}.m3u8?utc={utc}&lutc={lutc}${codeQ}${qualityQ}" `
         : "";
+      const chnoAttr = c.stbNumber ? `tvg-chno="${c.stbNumber}" ` : "";
+      if (extra && extra.licenseKey) {
+        lines.push("#KODIPROP:inputstream=inputstream.adaptive");
+        lines.push("#KODIPROP:inputstream.adaptive.manifest_type=mpd");
+        lines.push("#KODIPROP:inputstream.adaptive.license_type=clearkey");
+        lines.push(`#KODIPROP:inputstream.adaptive.license_key=${extra.licenseKey}`);
+      } else if (widevine) {
+        // Kodi license_key = url|headers|body|response: raw challenge (R{SSM}) in, raw license out.
+        // The URL is our license proxy; Jio's tokens never appear in the playlist.
+        lines.push("#KODIPROP:inputstream=inputstream.adaptive");
+        lines.push("#KODIPROP:inputstream.adaptive.manifest_type=mpd");
+        lines.push("#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha");
+        lines.push(
+          `#KODIPROP:inputstream.adaptive.license_key=${base}/license/${encodeURIComponent(c.id)}` +
+            `${code ? `?code=${encodeURIComponent(code)}` : ""}|Content-Type=application/octet-stream|R{SSM}|`
+        );
+      }
       lines.push(
-        `#EXTINF:-1 tvg-id="${attr(c.id)}" tvg-name="${attr(c.name)}" tvg-logo="${attr(c.logoUrl)}" ` +
+        `#EXTINF:-1 tvg-id="${attr(c.id)}" tvg-name="${attr(c.name)}" ${chnoAttr}tvg-logo="${attr(c.logoUrl)}" ` +
           `group-title="${attr(c.group)}" tvg-language="${attr(c.language)}" ${catchupAttr},${c.name}`
       );
       lines.push(streamUrl);
@@ -109,49 +132,69 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
     const utcRaw = String(q.utc ?? q.lutc ?? "").trim();
 
     let key = rawId;
+
+    if (isExtraChannel(rawId)) {
+      try {
+        const extra = await getExtraChannel(rawId);
+        if (!extra) return reply.code(404).send("# Extra channel not found");
+
+        const upstream = await proxyUpstream(rawId, extra.streamUrl);
+        const ct = upstream.headers.get("content-type") ?? (extra.isMpd ? "application/dash+xml" : "application/vnd.apple.mpegurl");
+        const text = await upstream.text();
+        const codeQ = code ? `&code=${encodeURIComponent(code)}` : "";
+        const segPrefix = `${baseUrl(req)}/seg?cid=${encodeURIComponent(rawId)}${codeQ}&u=`;
+        const rewritten = rewriteManifest(text, ct, extra.streamUrl, segPrefix, maxHeight) ?? text;
+        reply.header("content-type", ct);
+        reply.header("x-content-type-options", "nosniff");
+        reply.header("content-security-policy", "sandbox");
+        return reply.send(rewritten);
+      } catch (err) {
+        return reply.code(502).send(`# ${(err as Error).message}`);
+      }
+    }
+
     if (utcRaw) {
       // Catch-up replay requested via IPTV {utc} parameter
       const utcNum = Number(utcRaw);
       const utcMs = Number.isFinite(utcNum) ? (utcNum > 1e11 ? utcNum : utcNum * 1000) : Date.parse(utcRaw);
-      if (Number.isFinite(utcMs) && utcMs > 0) {
-        try {
-          const epg = await getNativeEpg(rawId, { fullCatchup: true });
-          const prog = epg.find((p) => utcMs >= p.startMs && utcMs < p.stopMs);
-          if (prog && prog.srno) {
-            const cu = {
-              c: rawId,
-              s: prog.srno,
-              p: prog.showId ?? "",
-              b: prog.startMs,
-              e: prog.stopMs,
-              t: prog.showtime ?? "",
-            };
-            const b64 = Buffer.from(JSON.stringify(cu), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-            key = `cu.${b64}`;
-          } else {
-            const cu = {
-              c: rawId,
-              s: randomUUID(),
-              p: "",
-              b: utcMs,
-              e: utcMs + 3600_000,
-              t: "",
-            };
-            const b64 = Buffer.from(JSON.stringify(cu), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-            key = `cu.${b64}`;
-          }
-        } catch {
-          /* fallback to live */
-        }
+      if (!Number.isFinite(utcMs) || utcMs <= 0) {
+        return reply.code(400).send("# Invalid utc / lutc catch-up time.");
       }
+      const epg = await getNativeEpg(rawId, { fullCatchup: true });
+      const prog = epg.find((p) => utcMs >= p.startMs && utcMs < p.stopMs);
+      // Jio can only replay a programme it has in its EPG (it needs that show's srno). Without one
+      // there is nothing to replay — say so instead of asking Jio for a made-up programme.
+      if (!prog || !prog.srno) {
+        return reply.code(404).send("# No catch-up programme in the guide at that time for this channel.");
+      }
+      const cu = {
+        c: rawId,
+        s: prog.srno,
+        p: prog.showId ?? "",
+        b: prog.startMs,
+        e: prog.stopMs,
+        t: prog.showtime ?? "",
+      };
+      const b64 = Buffer.from(JSON.stringify(cu), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      key = `cu.${b64}`;
     }
 
     try {
       const info = await getPlaybackInfo(key);
       if (info.isMpd) {
-        return reply
-          .code(415)
-          .send("# This channel is DRM (Widevine) and cannot be played in external players. Use the web player or the TV app.");
+        // Only the `drm=1` playlist asks for `.mpd`, together with the KODIPROP license lines.
+        if (!/\.mpd$/i.test(req.params.id)) {
+          return reply
+            .code(415)
+            .send("# This channel is DRM (Widevine). Use the playlist with drm=1 in a Widevine player (Kodi, TiviMate, OTT Navigator), the web player or the TV app.");
+        }
+        const upstream = await proxyUpstream(key, info.manifestUrl);
+        if (!upstream.ok) return reply.code(502).send(`# Upstream manifest failed (HTTP ${upstream.status})`);
+        const proxyDir = `${baseUrl(req)}/dash/${code ? encodeURIComponent(code) : "-"}/${encodeURIComponent(key)}/`;
+        reply.header("content-type", "application/dash+xml");
+        reply.header("x-content-type-options", "nosniff");
+        reply.header("content-security-policy", "sandbox");
+        return reply.send(rewriteMpdForPlayer(await upstream.text(), info.manifestUrl, proxyDir));
       }
       const upstream = await proxyUpstream(key, info.manifestUrl);
       const ct = upstream.headers.get("content-type") ?? "application/vnd.apple.mpegurl";
@@ -167,7 +210,7 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
   });
 
   // ── Segment / nested-manifest proxy for external players (code-authed twin of /api/proxy) ──
-  app.get<{ Querystring: { cid?: string; u?: string } }>("/seg", { preHandler: requireCode }, async (req, reply) => {
+  app.get<{ Querystring: { cid?: string; u?: string } }>("/seg", { logLevel: "warn", preHandler: requireCode }, async (req, reply) => {
     const { cid, u } = req.query;
     const code = String((req.query as Record<string, unknown>).code ?? "").trim();
     if (!cid || !u) return reply.code(400).send({ error: "cid and u are required" });
@@ -175,6 +218,9 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
       const target = decodeURIComponent(u);
       const isManifestUrl = /\.(mpd|m3u8)(\?|$)/i.test(target);
       const upstream = await proxyUpstream(cid, target, isManifestUrl ? undefined : (req.headers["range"] as string | undefined));
+      // Upstream bytes are served from our origin: never let a text/html answer run script here.
+      reply.header("x-content-type-options", "nosniff");
+      reply.header("content-security-policy", "sandbox");
       const contentType = upstream.headers.get("content-type") ?? "";
 
       const looksManifest =
@@ -191,17 +237,56 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
         return reply.send(rewritten ?? text);
       }
 
-      reply.code(upstream.status);
-      for (const h of ["content-type", "content-length", "accept-ranges", "content-range"]) {
-        const v = upstream.headers.get(h);
-        if (v) reply.header(h, v);
-      }
-      if (!upstream.body) return reply.send();
-      return reply.send(Readable.fromWeb(upstream.body as any));
+      return pipeUpstream(reply, upstream);
     } catch (err) {
       return reply.code(502).send({ error: (err as Error).message });
     }
   });
+
+  // ── DASH segments for the `drm=1` entries ──
+  // The rewritten MPD's BaseURL points here. The code sits in the PATH because players resolve the
+  // relative segment names against the BaseURL, which would drop a query string. The path after the
+  // key is resolved against the channel's real manifest directory; proxyUpstream keeps it on Jio hosts.
+  app.get<{ Params: { code: string; key: string } }>("/dash/:code/:key/*", { logLevel: "warn" }, async (req, reply) => {
+    if (!codeValid(decodeURIComponent(req.params.code))) {
+      return reply.code(401).send({ error: "Invalid or missing access code" });
+    }
+    const key = req.params.key;
+    if (isExtraChannel(key)) return reply.code(404).send({ error: "Not a Jio DRM channel" });
+    try {
+      const info = await getPlaybackInfo(key);
+      // Raw path + query after `/dash/<code>/<key>/`, exactly as the player built it.
+      const rest = req.url.split("/").slice(4).join("/");
+      const target = new URL(rest, manifestDir(info.manifestUrl)).toString();
+      const upstream = await proxyUpstream(key, target, req.headers["range"] as string | undefined);
+      reply.header("x-content-type-options", "nosniff");
+      reply.header("content-security-policy", "sandbox");
+      return pipeUpstream(reply, upstream);
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  // ── Widevine license proxy for the `drm=1` entries (Kodi `license_key`, raw challenge in/out) ──
+  app.post<{ Params: { key: string } }>(
+    "/license/:key",
+    // A player asks once per channel start (plus key rotations): 60/min per client is plenty, and
+    // keeps a leaked code from hammering Jio's license server with this account.
+    { config: { rateLimit: { max: 60, timeWindow: "1 minute" } }, bodyLimit: 64 * 1024, preHandler: requireCode },
+    async (req, reply) => {
+      const challenge = req.body;
+      if (!Buffer.isBuffer(challenge) || challenge.length === 0) {
+        return reply.code(400).send({ error: "Send the raw Widevine challenge as the request body" });
+      }
+      if (isExtraChannel(req.params.key)) return reply.code(404).send({ error: "Not a Jio DRM channel" });
+      try {
+        reply.header("content-type", "application/octet-stream");
+        return reply.send(await proxyLicense(req.params.key, challenge));
+      } catch (err) {
+        return reply.code(502).send({ error: (err as Error).message });
+      }
+    }
+  );
 
   // ── XMLTV guide for external players ──
   app.get("/epg.xml", { preHandler: requireCode }, async (req, reply) => {
@@ -215,22 +300,60 @@ export async function registerPlaylistRoutes(app: FastifyInstance): Promise<void
       }
     }
     // Native mode (or a failed XMLTV download): the full guide built in the background from Jio's own
-    // EPG. Until the first build finishes, a channel-only guide so players still map names + logos.
-    const native = getNativeXmltv("xml");
-    return reply.send(native ?? (await channelOnlyXmltv()));
+    // EPG, streamed from its gzip file on disk. Until the first build finishes, a channel-only guide so
+    // players still map names + logos.
+    const file = getNativeXmltvFile();
+    if (!file) return reply.send(await channelOnlyXmltv());
+    reply.header("vary", "accept-encoding");
+    if (acceptsGzip(req.headers["accept-encoding"])) {
+      reply.header("content-encoding", "gzip");
+      return sendFile(reply, file);
+    }
+    return reply.send(fs.createReadStream(file).pipe(zlib.createGunzip()));
   });
 
   // Same guide, gzipped (~10x smaller) — many players accept `epg.xml.gz` directly.
   app.get("/epg.xml.gz", { preHandler: requireCode }, async (_req, reply) => {
-    const cfg = getEpgConfig();
-    let body: Buffer | null = null;
-    if (cfg.mode === "xmltv" && cfg.url) {
-      try { body = zlib.gzipSync(await fetchXmltv(cfg.url)); } catch { /* fall back to native */ }
-    }
-    body ??= (getNativeXmltv("gz") as Buffer | null) ?? zlib.gzipSync(await channelOnlyXmltv());
     reply.header("content-type", "application/gzip");
-    return reply.send(body);
+    const cfg = getEpgConfig();
+    if (cfg.mode === "xmltv" && cfg.url) {
+      try { return reply.send(zlib.gzipSync(await fetchXmltv(cfg.url))); } catch { /* fall back to native */ }
+    }
+    const file = getNativeXmltvFile();
+    if (file) return sendFile(reply, file);
+    return reply.send(zlib.gzipSync(await channelOnlyXmltv()));
   });
+}
+
+/** True unless the client's Accept-Encoding rules gzip out (missing header = identity only). */
+export function acceptsGzip(header: string | string[] | undefined): boolean {
+  const v = (Array.isArray(header) ? header.join(",") : header ?? "").toLowerCase();
+  for (const part of v.split(",")) {
+    const [name, ...params] = part.trim().split(";").map((x) => x.trim());
+    if (name !== "gzip" && name !== "*") continue;
+    const q = params.find((x) => x.startsWith("q="));
+    if (!q || Number(q.slice(2)) > 0) return true;
+  }
+  return false;
+}
+
+/** Streams an upstream media response through with its status and range headers. */
+function pipeUpstream(reply: FastifyReply, upstream: Response) {
+  reply.code(upstream.status);
+  for (const h of ["content-type", "content-length", "accept-ranges", "content-range"]) {
+    const v = upstream.headers.get(h);
+    if (v) reply.header(h, v);
+  }
+  if (!upstream.body) return reply.send();
+  return reply.send(Readable.fromWeb(upstream.body as any));
+}
+
+/** Streams a file with its length. Opened first, so a rebuild renaming a new file over it mid-send
+ *  can't make the length and the bytes disagree. */
+function sendFile(reply: FastifyReply, file: string) {
+  const fd = fs.openSync(file, "r");
+  reply.header("content-length", fs.fstatSync(fd).size);
+  return reply.send(fs.createReadStream("", { fd }));
 }
 
 function qualityToHeight(q: string): number | undefined {
@@ -242,7 +365,7 @@ function qualityToHeight(q: string): number | undefined {
 let xmltvCache: { at: number; text: string } | null = null;
 async function fetchXmltv(url: string): Promise<string> {
   if (xmltvCache && Date.now() - xmltvCache.at < 30 * 60 * 1000) return xmltvCache.text;
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(120_000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   let buf = Buffer.from(await res.arrayBuffer());
   if (buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf);

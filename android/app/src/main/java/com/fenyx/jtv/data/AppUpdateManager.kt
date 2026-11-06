@@ -18,6 +18,7 @@ import java.net.URL
 object AppUpdateManager {
     private const val TAG = "AppUpdateManager"
     private const val GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/F-e-n-y-x/JioTV-AndroidTV-/releases/latest"
+    private const val GITHUB_RELEASES_URL = "https://api.github.com/repos/F-e-n-y-x/JioTV-AndroidTV-/releases"
 
     data class UpdateInfo(
         val versionName: String,
@@ -38,9 +39,18 @@ object AppUpdateManager {
      * Parses semantic version string (e.g., "1.5.3" or "v1.5.3") into a comparable integer list.
      */
     private fun parseVersion(v: String): List<Int> {
-        val clean = v.trim().removePrefix("v").removePrefix("V")
-        return clean.split(".").mapNotNull { it.takeWhile { c -> c.isDigit() }.toIntOrNull() }
+        val core = v.trim().removePrefix("v").removePrefix("V").substringBefore('-')
+        return core.split(".").mapNotNull { it.takeWhile { c -> c.isDigit() }.toIntOrNull() }
     }
+
+    /** "2.0-beta.3" -> 3, "2.0-beta" -> 1, "2.0" (stable) -> null. */
+    private fun preReleaseNumber(v: String): Int? {
+        val pre = v.trim().substringAfter('-', "")
+        if (pre.isEmpty()) return null
+        return pre.takeLastWhile { it.isDigit() }.toIntOrNull() ?: 1
+    }
+
+    fun isPreRelease(version: String) = preReleaseNumber(version) != null
 
     fun isNewerVersion(remoteVersion: String, currentVersion: String): Boolean {
         val remoteParts = parseVersion(remoteVersion)
@@ -52,13 +62,23 @@ object AppUpdateManager {
             if (r > c) return true
             if (r < c) return false
         }
-        return false
+        // Same numbers: a stable release beats any beta of it; a later beta beats an earlier one.
+        val rp = preReleaseNumber(remoteVersion)
+        val cp = preReleaseNumber(currentVersion)
+        return when {
+            cp == null -> false
+            rp == null -> true
+            else -> rp > cp
+        }
     }
 
     suspend fun checkForUpdate(context: Context): Result<UpdateInfo?> = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
-            val url = URL(GITHUB_LATEST_RELEASE_URL)
+            // Stable installs only ever see /releases/latest (GitHub excludes pre-releases there), so
+            // they never move to a beta. Beta installs look at the newest releases, beta or stable.
+            val onBeta = isPreRelease(getCurrentVersionName(context))
+            val url = URL(if (onBeta) "$GITHUB_RELEASES_URL?per_page=10" else GITHUB_LATEST_RELEASE_URL)
             connection = url.openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             connection.connectTimeout = 10000
@@ -68,10 +88,18 @@ object AppUpdateManager {
 
             if (connection.responseCode in 200..299) {
                 val responseText = connection.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(responseText)
+                val json = if (!onBeta) JSONObject(responseText) else {
+                    val list = org.json.JSONArray(responseText)
+                    (0 until list.length()).map { list.getJSONObject(it) }
+                        .filter { !it.optBoolean("draft", false) }
+                        .maxWithOrNull { x, y ->
+                            val a = x.optString("tag_name").removePrefix("v"); val b = y.optString("tag_name").removePrefix("v")
+                            when { isNewerVersion(a, b) -> 1; isNewerVersion(b, a) -> -1; else -> 0 }
+                        } ?: return@withContext Result.success(null)
+                }
                 val tagName = json.optString("tag_name", "")
                 val remoteVersionName = tagName.removePrefix("v").removePrefix("V")
-                val changelog = json.optString("body", "No changelog provided.")
+                val changelog = json.optString("body", "") // blank: the UI shows its own (translated) default
 
                 var apkDownloadUrl = ""
                 var apkSize = 0L
@@ -123,9 +151,12 @@ object AppUpdateManager {
         downloadUrl: String,
         onProgress: (bytesDownloaded: Long, totalBytes: Long, progress: Float) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
-        val targetDir = context.getExternalFilesDir(null) ?: context.cacheDir
-        val targetFile = File(targetDir, "JTV_update.apk")
+        // Private cache (file_paths.xml cache-path): on Android 9 and older, any app with storage
+        // permission could swap an APK in external app storage before the installer reads it.
+        val targetFile = File(context.cacheDir, "JTV_update.apk")
         if (targetFile.exists()) targetFile.delete()
+        // Older versions saved it in external app storage; don't leave that copy behind.
+        context.getExternalFilesDir(null)?.let { File(it, "JTV_update.apk").delete() }
 
         var connection: HttpURLConnection? = null
         var inputStream: InputStream? = null
@@ -160,7 +191,7 @@ object AppUpdateManager {
                 }
             }
 
-            val totalBytes = connection.contentLength.toLong()
+            val totalBytes = connection.contentLengthLong
             inputStream = connection.inputStream
             outputStream = FileOutputStream(targetFile)
 
@@ -175,6 +206,11 @@ object AppUpdateManager {
                 onProgress(bytesDownloaded, totalBytes, progress)
             }
             outputStream.flush()
+            // A connection closed early still ends the read loop normally: never hand a cut-off APK to the installer.
+            if (totalBytes > 0 && bytesDownloaded != totalBytes) {
+                targetFile.delete()
+                return@withContext Result.failure(Exception("Download incomplete ($bytesDownloaded of $totalBytes bytes). Try again."))
+            }
             Result.success(targetFile)
         } catch (e: Exception) {
             Log.e(TAG, "Error downloading APK", e)

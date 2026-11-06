@@ -52,6 +52,9 @@ object ChannelLanguage {
      * ("Star Sports 1 Hindi HD") is preserved on the base so HD and SD feeds never merge.
      * Returns langCode = null (and base = full name) when no trailing language token is present.
      */
+    /** Code for a language name as Jio writes it ("English" -> "en"), or null. */
+    fun codeFor(languageName: String?): String? = languageName?.trim()?.lowercase()?.let { LANG_TOKENS[it] }
+
     fun detect(name: String): LangInfo {
         val parts = name.trim().split(Regex("\\s+")).toMutableList()
         if (parts.size < 2) return LangInfo(name.trim(), null)
@@ -145,4 +148,35 @@ object ChannelLanguage {
 
     /** One language feed within a collapsed logical channel. */
     data class Variant(val langCode: String?, val channel: Channel)
+
+    /**
+     * Channels known to carry in-stream multi-audio tracks, keyed by lowercase base name (no HD/language
+     * suffix), matched on whole words. Curated: confirm a channel really ships extra audio before adding.
+     */
+    private val MULTI_AUDIO_MAP: Map<String, Set<String>> = mapOf(
+        "disney channel" to setOf("Hindi", "English", "Tamil", "Telugu"),
+        "disney junior" to setOf("Hindi", "English", "Tamil", "Telugu"),
+        "hungama" to setOf("Hindi", "Tamil", "Telugu"),
+        "super hungama" to setOf("Hindi", "Tamil", "Telugu", "English"),
+        "pogo" to setOf("Hindi", "Tamil", "Telugu"),
+        "sonic" to setOf("Hindi", "Tamil", "Telugu"),
+        "nickelodeon" to setOf("Hindi", "English", "Tamil", "Telugu"),
+        "nick" to setOf("Hindi", "English", "Tamil", "Telugu"),
+        "cartoon network" to setOf("English", "Hindi", "Tamil", "Telugu", "Kannada", "Malayalam", "Marathi"),
+        "sony yay" to setOf("Hindi", "Tamil", "Telugu", "Bengali", "Malayalam")
+    )
+
+    /**
+     * Returns all languages offered by [channel], combining its primary catalog language,
+     * any in-stream multi-audio languages, and languages from sibling variants if provided.
+     */
+    fun channelSupportedLanguages(channel: Channel, variantLangs: List<String> = emptyList()): Set<String> {
+        val set = mutableSetOf(channel.language)
+        variantLangs.forEach { set.add(it) }
+        val padded = " ${detect(channel.name).base.lowercase().trim()} "
+        MULTI_AUDIO_MAP.forEach { (key, langs) ->
+            if (padded.contains(" $key ")) set.addAll(langs) // whole-word match: "nick" != "nickname"
+        }
+        return set
+    }
 }
