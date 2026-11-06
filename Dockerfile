@@ -27,7 +27,6 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=web /web/dist ./web/dist
 EXPOSE 8080
-VOLUME ["/app/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD wget -qO- http://127.0.0.1:8080/api/status || exit 1
 CMD ["node", "dist/server.js"]
